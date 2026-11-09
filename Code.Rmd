@@ -12,7 +12,7 @@ output:
 knitr::opts_chunk$set(eval = FALSE)
 ```
 
-This repository contains the code needed to replicate the experiments described in the research article of the same title.
+This repository contains the code needed to replicate the experiments described in the research article of the same title: Continuous and Ordinal Machine Learning for Kansei-Based Product Perception: Predictive Equivalence and Explainable Modeling
 
 # Library
 
