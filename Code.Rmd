@@ -1,8 +1,5 @@
 ---
-s---
-title: "Continuous versus Ordinal Supervised Regression for Kansei
-Perception Modeling: A Comparative and Explainable Approach"
-author: "M.M.Pizarro, A.G.González, O.López, L.Rodriguez-de Cos"
+title: "Continuous and Ordinal Machine Learning for Kansei-Based Product Perception: Predictive Equivalence and Explainable Modeling"
 output:
   html_document:
     toc: true
