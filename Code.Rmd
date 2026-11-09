@@ -1,0 +1,403 @@
+---
+s---
+title: "Continuous versus Ordinal Supervised Regression for Kansei
+Perception Modeling: A Comparative and Explainable Approach"
+author: "M.M.Pizarro, A.G.González, O.López, L.Rodriguez-de Cos"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+This repository contains the code needed to replicate the experiments described in the research article of the same title.
+
+# Library
+
+```{r}
+packages <- c("tidyverse","ordinal","ranger","gbm","xgboost","e1071","FNN","kernelshap")
+suppressMessages(invisible(lapply(packages,library, character.only = TRUE)))
+sessionInfo()
+```
+
+# Configuration
+
+```{r}
+name_case <- "controller"
+cfgs <- switch (name_case,
+                controller = list(name_dat = "VideoController.txt",
+                                  target = "Ergonomic",
+                                  out = paste0("result_",name_case)),
+                harness = list(name_dat = "Harness.txt",
+                               target = "Strength",
+                               out = paste0("result_",name_case))
+)
+
+folds_inner <- 4
+n_boot <- 2000
+n_perm <- 10
+n_cores <- 4
+eq_margins <- c(0.05,0.10,0.25)
+SEED <- 2026
+
+dir.create(cfgs$out, showWarnings = FALSE)
+set.seed(SEED)
+
+pairs_models <- data.frame(
+  cont = c("LM_PCA","KNN_mean","RF","GB","XGB","SVR"),
+  ord = c("CO_PCA","KNN_median","RF_Ord","GB_Ord","XGB_Ord","SVR_Ord")
+)
+models <- as.vector(t(pairs_models))
+```
+
+# Data
+
+```{r}
+dat <- read.table(cfgs$name_dat, header = TRUE) |> 
+  mutate(Design = factor(Design))
+X <- dat |> select(-all_of(c("ParticipantID","Fold",cfgs$target)))
+Y <- dat |> pull(cfgs$target)
+```
+
+# Supervised Models
+
+## Auxiliar Functions
+
+```{r}
+clip <- function(x) pmin(pmax(floor(x + 0.5), 1),5)
+pl <- function(x,FUN){
+  if(n_cores > 1 && .Platform$OS.type != "windows")
+    parallel::mclapply(x,FUN,mc.cores = n_cores, mc.preschedule = FALSE) 
+  else
+      lapply(x,FUN)
+}
+
+metrics <- function(obs,pred_ord,pred_cont){
+  #QWK
+  w <- outer(1:5,1:5,function(i,j) (i-j)^2/16)
+  o <- table(factor(obs,1:5),factor(pred_ord,1:5))
+  e <- outer(rowSums(o), colSums(o))/sum(o)
+  
+  c(RMSE = sqrt(mean((obs-pred_cont)^2)),
+    MAE = mean(abs(obs-pred_cont)),
+    Acc_pm1 = mean(abs(obs-pred_ord) <= 1),
+    QWK = 1-sum(w*o)/sum(w*e),
+    Spearman = cor(obs,pred_ord,method = "spearman"))
+}
+```
+
+## Grid hyperparameters
+
+```{r}
+grids <- list(
+  LM_PCA = expand.grid(n_pc = 2:6),
+  CO_PCA = expand.grid(n_pc = 2:6),
+  KNN_mean = expand.grid(n_pc = 2:6, k = c(3,5,7,9,11)), 
+  KNN_median = expand.grid(n_pc = 2:6, k = c(3,5,7,9,11)),
+  RF = expand.grid(mtry = c(3,5,7), min.node = c(3,5,10)), 
+  RF_Ord = expand.grid(mtry = c(3,5,7), min.node = c(3,5,10)),
+  GB = expand.grid(n_trees = c(50,100,200), depth = 1:3, eta = c(0.05,0.1)),
+  GB_Ord = expand.grid(n_trees = c(50,100,200), depth = 1:3, eta = c(0.05,0.1)),
+  XGB = expand.grid(n_trees = c(50,100,200), depth = 1:3, eta = c(0.05,0.1)),
+  XGB_Ord = expand.grid(n_trees = c(50,100,200), depth = 1:3, eta = c(0.05,0.1)),
+  SVR = expand.grid(cost = 2^seq(-1,2), gamma = c(0.01,0.05,0.1)),
+  SVR_Ord = expand.grid(cost = 2^seq(-1,2), gamma = c(0.01,0.05,0.1))
+)
+```
+
+## Frank and Hall decomposition
+
+```{r}
+FrankHall_decomp <- function(X,Y,L,hp){
+  mods <- lapply(1:4, function(k){
+    z <- as.numeric(Y > k)
+    L$fit(X,z,hp)
+  })
+  function(X){
+    p <- vapply(mods,function(m) as.numeric(L$pred(m,X,hp)), numeric(nrow(X)))
+    p <- t(apply(p,1,cummin))
+    Prob <- cbind(1 - p[,1], p[,1] - p[,2], p[,2] - p[,3], p[,3] - p[,4], p[,4])
+    Prob[Prob < 0 & Prob > -1e-10] <- 0
+    Prob / rowSums(Prob)
+  }
+}
+
+FH_Ordinals <- list(
+  GB = list(
+    fit = function(X,z,hp) gbm(z ~ ., data = data.frame(X, z = z), 
+                               distribution = "bernoulli", n.trees = hp$n_trees,
+                               interaction.depth = hp$depth, shrinkage = hp$eta,
+                               n.minobsinnode = 3, verbose = FALSE),
+    pred = function(m,X,hp) predict(m,X,n.trees = hp$n_trees, type = "response")
+  ),
+  XGB = list(
+    fit = function(X,z,hp) xgb.train(params = list(objective = "binary:logistic",
+                                                   max_depth = hp$depth, eta = hp$eta,
+                                                   nthread = 1),
+                                     data = xgb.DMatrix(as.matrix(X), label = z),
+                                     nrounds = hp$n_trees, verbose = 0),
+    pred = function(m,X,hp) predict(m,as.matrix(X))
+  ),
+  SVR = list(
+    fit = function(X,z,hp) svm(X,factor(z), kernel = "radial",
+                               cost = hp$cost, gamma = hp$gamma, 
+                               probability = TRUE),
+    pred = function(m,X,hp) attr(predict(m,X,probability = TRUE),"probabilities")[,"1"]
+  )
+)
+```
+
+## Fit models
+
+```{r}
+fit_model <- function(m,X_train,Y_train,hp){
+  
+  set.seed(SEED)
+  num_cols <- setdiff(names(X_train),"Design")
+  mu <- colMeans(X_train[,num_cols]); sigma <- apply(X_train[,num_cols],2,sd); sigma[sigma == 0] <- 1
+  Z <- function(X) as.data.frame(scale(X[,num_cols,drop = FALSE],mu,sigma))
+  Dummies <- function(X){
+    D <- as.data.frame(model.matrix(~ Design, X)[,-1,drop = FALSE])
+    names(D) <- make.names(names(D)); D
+  }
+  Fz <- function(X) cbind(Z(X),Dummies(X))
+  Fr <- function(X) cbind(Z(X),Dummies(X))
+  
+  pca <- prcomp(Z(X_train))
+  Fp <- function(X) cbind(as.data.frame(predict(pca,Z(X))[,1:hp$n_pc,drop = FALSE]), Dummies(X))
+  
+  Y_factor <- droplevels(factor(Y_train, levels = 1:5, ordered = TRUE))
+  
+  cont <- function(ev) list(ev = ev, pred = function(X) clip(ev(X)))
+  ord <- function(prob) list(prob = prob,
+                             ev = function(X) as.vector(prob(X) %*% 1:5),
+                             pred = function(X) apply(prob(X),1,function(r) which(cumsum(r) >= 0.5 - 1e-9)[1]))
+  vec <- function(){
+    F_train <- Fp(X_train)
+    muk <- colMeans(F_train); sigmak <- apply(F_train,2,sd); sigmak[sigmak == 0] <- 1
+    K_train <- scale(F_train,muk,sigmak)
+    function(X) get.knnx(K_train,scale(Fp(X),muk,sigmak),
+                         k = hp$k)$nn.index
+  }
+  
+  mt <- function() min(hp$mtry, ncol(Fr(X_train)))
+  
+  switch (m,
+    LM_PCA = {fit <- lm(y ~ ., data.frame(y = Y_train, Fp(X_train)))
+              cont(function(X) as.numeric(predict(fit,Fp(X))))},
+    CO_PCA = {Ftr <- Fp(X_train)
+              fit <- clm(reformulate(names(Ftr),"y"),
+                         data = data.frame(y = Y_factor, Ftr))
+              ord(function(X) predict(fit, newdata = Fp(X), type = "prob")$fit)},
+    KNN_mean = {nn <- vec()
+                cont(function(X) apply(nn(X), 1, function(i) mean(Y_train[i])))},
+    KNN_median = {nn <- vec()
+                  ord(function(X) t(apply(nn(X),1,function(i) tabulate(as.integer(Y_train[i]),5)/ hp$k)))},
+    RF = {fit <- ranger(y ~ ., data.frame(y = Y_train, Fr(X_train)),
+                         num.trees = 500, mtry = mt(), 
+                         min.node.size = hp$min.node, num.threads = 1)
+          cont(function(X) predict(fit, Fr(X))$predictions)},
+    RF_Ord = {rp <- ranger(y ~ ., data.frame(y = factor(Y_train, ordered = FALSE), Fr(X_train)),
+                           probability = TRUE, num.trees = 500, mtry = mt(), 
+                           min.node.size = hp$min.node, num.threads = 1)
+                           ord(function(X) predict(rp,Fr(X))$predictions)},
+    GB = {fit <- gbm(y ~ ., data.frame(y = Y_train, Fr(X_train)),
+                     distribution = "gaussian", n.trees = hp$n_trees,
+                     interaction.depth = hp$depth, shrinkage = hp$eta,
+                     n.minobsinnode = 3, verbose = FALSE)
+          cont(function(X) predict(fit, Fr(X), n.trees = hp$n_trees))},
+    GB_Ord = {fh <- FrankHall_decomp(Fr(X_train), Y_train, 
+                                      FH_Ordinals$GB, hp)
+               ord(function(X) fh(Fr(X)))},
+    XGB = {fit <- xgb.train(params = list(objective = "reg:squarederror",
+                                           max_depth = hp$depth, eta = hp$eta, nthread = 1),
+                             data = xgb.DMatrix(as.matrix(Fr(X_train)), label = Y_train),
+                             nrounds = hp$n_trees, verbose = 0)
+            cont(function(X) predict(fit, as.matrix(Fr(X))))},
+    XGB_Ord = {fh <- FrankHall_decomp(Fr(X_train), Y_train, 
+                                       FH_Ordinals$XGB, hp)
+                ord(function(X) fh(Fr(X)))},
+    SVR = {fit <- svm(y ~ ., data.frame(y = Y_train, Fz(X_train)), type = "eps-regression",
+                       kernel = "radial",cost = hp$cost, gamma = hp$gamma)
+            cont(function(X) as.numeric(predict(fit,Fz(X))))},
+    SVR_Ord = {fh <- FrankHall_decomp(Fr(X_train), Y_train, 
+                                       FH_Ordinals$SVR, hp)
+                ord(function(X) fh(Fr(X)))}
+  )
+}
+```
+
+## Nested Cross-Validation
+
+```{r}
+tune <- function(m, X_train, Y_train, sub_train, seed = SEED){
+  
+  set.seed(seed)
+  grid <- grids[[m]]
+  us <- unique(sub_train)
+  inner <- setNames(sample(rep(1:folds_inner, length.out = length(us))), us)[as.character(sub_train)]
+  cv_MAE <- sapply(seq_len(nrow(grid)), function(j){
+    
+    hp <- as.list(grid[j, , drop = FALSE])
+    p <- rep(NA_real_, length(Y_train))
+    for(k in 1:folds_inner){
+      ii_train <- inner != k; ii_val <- inner == k
+      fit <- fit_model(m, X_train[ii_train, , drop = FALSE], Y_train[ii_train], hp)
+      p[ii_val] <- fit$ev(X_train[ii_val, , drop = FALSE])
+    }
+    mean(abs(Y_train - p))
+  })
+  j <- which.min(cv_MAE)
+  table <- cbind(config_id = seq_len(nrow(grid)), grid, cv_MAE = cv_MAE)
+  list(hp = as.list(grid[j, , drop = FALSE]), cv_MAE = cv_MAE[j], 
+       table = table)
+}
+```
+
+## Algorithms execution
+
+```{r}
+oof <- data.frame(subject = dat$ParticipantID, design = dat$Design, obs = Y)
+for(m in models) oof[[m]] <- NA_real_
+oof_ev <- oof #continuous predictions
+best_hp <- list()
+
+for(f in sort(unique(dat$Fold))){
+  
+  cat("Extern Fold", f, "\n")
+  tr <- dat$Fold != f
+  res <- pl(models, function(m){
+    
+    tn <- tune(m, X[tr, ], Y[tr], dat$ParticipantID[tr])
+    fit <- fit_model(m, X[tr, ], Y[tr], tn$hp)
+    list(pred = fit$pred(X[!tr,]), ev = fit$ev(X[!tr,]),
+         hp = tn$hp, cv = tn$cv_MAE,
+         tunning = transform(tn$table, model = m, extern_fold = f))
+  })
+  
+  for(i in seq_along(models)){
+    
+    oof[[models[i]]][!tr] <- res[[i]]$pred
+    oof_ev[[models[[i]]]][!tr] <- res[[i]]$ev
+    best_hp[[paste(models[i],f)]] <- res[[i]]$hp
+    
+  }
+
+}
+
+```
+
+# Inference Results
+
+## Metrics and CI 95% Bootstrap
+
+```{r}
+set.seed(SEED)
+est <- sapply(models, function(m) metrics(oof$obs, oof[[m]], oof_ev[[m]]))
+idx <- split(seq_len(nrow(oof)), oof$subject)
+```
+
+```{r}
+bs <- replicate(n_boot,{
+  i <- unlist(idx[sample(names(idx), replace = TRUE)])
+  sapply(models, function(m) metrics(oof$obs[i], oof[[m]][i], oof_ev[[m]][i]))
+})
+lo <- apply(bs, c(1,2), quantile, 0.025, na.rm = TRUE)
+hi <- apply(bs, c(1,2), quantile, 0.975, na.rm = TRUE)
+
+CI_table <- matrix(sprintf("%.3f [%.3f, %.3f]", est, lo, hi), nrow(est), dimnames = dimnames(est))
+print(CI_table)
+```
+
+## TOST equivalence
+
+```{r}
+TOST <- function(d, delta, B = n_boot){
+  
+  set.seed(SEED)
+  d <- d[is.finite(d)]
+  bd <- replicate(B, mean(sample(d, length(d), replace = TRUE)))
+  ci_boot <- quantile(bd, c(0.05,0.95), names = FALSE)
+  
+  lo_p <- t.test(d, mu = -delta, alternative = "greater")$p.value
+  hi_p <- t.test(d, mu = delta, alternative = "less")$p.value
+  
+  c(dif_MAE = mean(d), 
+    lo_CI = ci_boot[1], hi_CI = ci_boot[2], p = max(lo_p,hi_p))
+}
+
+pairs_modelsTOST <- pairs_models[c(1,3:6),]
+MAE <- sapply(models, function(m) tapply(abs(oof_ev$obs - oof_ev[[m]]), oof_ev$subject, mean))
+dif <- lapply(seq_len(nrow(pairs_modelsTOST)), 
+                           function(i) MAE[, pairs_modelsTOST$cont[i]] - MAE[, pairs_modelsTOST$ord[i]])
+
+res <- list()
+for(delta in eq_margins){
+  
+  tt <- t(sapply(dif, TOST, delta = delta))
+  res[[as.character(delta)]] <- data.frame(margin = delta, pair = paste0(pairs_modelsTOST$cont, " vs ", pairs_modelsTOST$ord),
+                                           TOST = round(tt,4), pHolm = p.adjust(tt[,"p"], method = "holm"))
+}
+
+print(res)
+```
+
+# Kansei Adjectives Importance
+
+```{r}
+imp_models <- c("LM_PCA","RF","GB","XGB","SVR")
+kansei <- setdiff(colnames(X), "Design")
+normalize <- function(x){
+  x <- pmax(x,0)
+  100*x/sum(x)
+}
+```
+
+## Permutation importance
+
+```{r}
+perm_imp <- function(model,nper = n_perm){
+  set.seed(SEED)
+  folds <- sort(unique(dat$Fold))
+  imp_f <- array(0, c(length(kansei),length(model),length(folds)), dimnames = list(kansei,model,paste0("Fold",folds)))
+  for(f in folds){
+    
+    tr <- dat$Fold != f; Xte <- X[!tr, ,drop = FALSE]; Yte <- Y[!tr]
+    for(m in model){
+      fit <- fit_model(m, X[tr, ,drop = FALSE], Y[tr],best_hp[[paste(m,f)]])
+      rmse_b <- sqrt(mean((Yte - fit$ev(Xte))^2))
+      for(v in kansei){
+        imp_f[v,m,f] <- mean(replicate(nper,{Xp <- Xte; Xp[[v]] <- sample(Xp[[v]]);
+                                             sqrt(mean((Yte - fit$ev(Xp))^2)) - rmse_b}))
+      }
+    }
+  }
+  imp_f
+  
+}
+
+imp <- apply(perm_imp(imp_models),c(1,2),mean)
+rel_imp <- apply(imp,2,normalize)
+print(rel_imp)
+```
+
+## SHAP
+
+```{r}
+final_model <- setNames(pl(imp_models, function(m){tn <- tune(m,X,Y,dat$ParticipantID)
+                                                   fit_model(m,X,Y,tn$hp)}), imp_models)
+shap <- lapply(final_model, function(ft){
+  set.seed(SEED)
+  r <- kernelshap(ft, X = X, bg_X = X, verbose = FALSE, 
+                  parallel = FALSE, pred_fun = function(object, newdata, ...) object$ev(newdata))
+  r$S})
+
+shap_imp <- sapply(shap, function(s) colMeans(abs(as.matrix(s)))[kansei]) 
+rel_shap <- apply(shap_imp,2,normalize)
+print(rel_shap)
+```
