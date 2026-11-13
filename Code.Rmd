@@ -1,5 +1,5 @@
 ---
-title: "Continuous and Ordinal Machine Learning for Kansei-Based Product Perception: Predictive Equivalence and Explainable Modeling"
+title: "PEX-Kansei: Validating Continuous and Ordinal Models of Kansei Ratings for AI-Assisted Engineering Design Evaluation"
 output:
   html_document:
     toc: true
@@ -12,7 +12,7 @@ output:
 knitr::opts_chunk$set(eval = FALSE)
 ```
 
-This repository contains the code needed to replicate the experiments described in the research article of the same title: Continuous and Ordinal Machine Learning for Kansei-Based Product Perception: Predictive Equivalence and Explainable Modeling
+This repository contains the code needed to replicate the experiments described in the research article of the same title: PEX-Kansei: Validating Continuous and Ordinal Models of Kansei Ratings for AI-Assisted Engineering Design Evaluation
 
 # Library
 
